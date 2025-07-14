@@ -13,6 +13,7 @@ import uuid
 from dotenv import load_dotenv
 import asyncio
 import json
+import re
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 load_dotenv()
@@ -52,6 +53,23 @@ security = HTTPBearer()
 DEFAULT_AI_PROVIDER = "gemini"
 DEFAULT_AI_KEY = "AIzaSyBgVNvJp88oDPsqERwMbZCjCV6fqDXIShg"
 
+# Create default superadmin if not exists
+def create_default_superadmin():
+    existing_admin = users_collection.find_one({"email": "admin@omnibot.com"})
+    if not existing_admin:
+        admin_data = {
+            "user_id": str(uuid.uuid4()),
+            "email": "admin@omnibot.com",
+            "full_name": "Super Admin",
+            "password": hash_password("admin123"),
+            "role": "superadmin",
+            "plan": "premium",
+            "created_at": datetime.utcnow(),
+            "is_active": True
+        }
+        users_collection.insert_one(admin_data)
+        print("✅ Default superadmin created: admin@omnibot.com / admin123")
+
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
@@ -71,6 +89,8 @@ class BotConfig(BaseModel):
     ai_api_key: Optional[str] = None
     system_message: str = "You are a helpful assistant."
     auto_reply: bool = True
+    phone_number: Optional[str] = None  # For WhatsApp
+    phone_number_id: Optional[str] = None  # For WhatsApp Business API
 
 class ChatMessage(BaseModel):
     message: str
@@ -88,6 +108,14 @@ class XenditSettings(BaseModel):
     api_key: str
     public_key: str
     callback_token: str
+
+class PhoneNumberVerification(BaseModel):
+    phone_number: str
+    verification_code: str
+
+class TestChatMessage(BaseModel):
+    message: str
+    bot_id: str
 
 # Utility functions
 def hash_password(password: str) -> str:
@@ -143,6 +171,12 @@ def get_user_limit(user_plan: str) -> int:
     }
     return limits.get(user_plan, 100)
 
+def validate_phone_number(phone_number: str) -> bool:
+    """Validate phone number format"""
+    # Basic phone number validation
+    pattern = r'^\+?[\d\s\-\(\)]{10,15}$'
+    return re.match(pattern, phone_number) is not None
+
 async def send_ai_message(message: str, ai_settings: dict, session_id: str = None) -> str:
     """Send message to AI provider and get response"""
     try:
@@ -175,6 +209,9 @@ async def send_ai_message(message: str, ai_settings: dict, session_id: str = Non
     except Exception as e:
         print(f"AI Error: {str(e)}")
         return f"Sorry, I encountered an error: {str(e)}"
+
+# Initialize default superadmin on startup
+create_default_superadmin()
 
 # Routes
 @app.get("/")
@@ -261,6 +298,11 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 async def create_bot(bot: BotConfig, current_user: dict = Depends(get_current_user)):
     bot_id = str(uuid.uuid4())
     
+    # Validate phone number for WhatsApp
+    if bot.platform == "whatsapp" and bot.phone_number:
+        if not validate_phone_number(bot.phone_number):
+            raise HTTPException(status_code=400, detail="Invalid phone number format")
+    
     bot_data = {
         "bot_id": bot_id,
         "user_id": current_user["user_id"],
@@ -273,6 +315,8 @@ async def create_bot(bot: BotConfig, current_user: dict = Depends(get_current_us
         "ai_api_key": bot.ai_api_key,
         "system_message": bot.system_message,
         "auto_reply": bot.auto_reply,
+        "phone_number": bot.phone_number,
+        "phone_number_id": bot.phone_number_id,
         "created_at": datetime.utcnow(),
         "is_active": True
     }
@@ -303,6 +347,11 @@ async def get_bot(bot_id: str, current_user: dict = Depends(get_current_user)):
 
 @app.put("/api/bots/{bot_id}")
 async def update_bot(bot_id: str, bot: BotConfig, current_user: dict = Depends(get_current_user)):
+    # Validate phone number for WhatsApp
+    if bot.platform == "whatsapp" and bot.phone_number:
+        if not validate_phone_number(bot.phone_number):
+            raise HTTPException(status_code=400, detail="Invalid phone number format")
+    
     result = bot_configs_collection.update_one(
         {"bot_id": bot_id, "user_id": current_user["user_id"]},
         {"$set": bot.dict()}
@@ -375,6 +424,31 @@ async def send_chat_message(message: ChatMessage, current_user: dict = Depends(g
         "remaining_chats": limit - chat_count - 1
     }
 
+@app.post("/api/chat/test")
+async def test_chat_message(message: TestChatMessage, current_user: dict = Depends(get_current_user)):
+    """Test chat message without saving to history or counting towards limit"""
+    # Get bot configuration
+    bot = bot_configs_collection.find_one({"bot_id": message.bot_id})
+    if not bot:
+        raise HTTPException(status_code=404, detail="Bot not found")
+    
+    # Prepare AI settings
+    ai_settings = {
+        "provider": bot.get("ai_provider", DEFAULT_AI_PROVIDER),
+        "model": bot.get("ai_model", "gemini-2.0-flash"),
+        "api_key": bot.get("ai_api_key", DEFAULT_AI_KEY),
+        "system_message": bot.get("system_message", "You are a helpful assistant.")
+    }
+    
+    # Send message to AI
+    session_id = f"test_{current_user['user_id']}_{message.bot_id}"
+    ai_response = await send_ai_message(message.message, ai_settings, session_id)
+    
+    return {
+        "response": ai_response,
+        "is_test": True
+    }
+
 @app.get("/api/chat/history/{bot_id}")
 async def get_chat_history(bot_id: str, current_user: dict = Depends(get_current_user)):
     history = list(chat_history_collection.find(
@@ -383,6 +457,33 @@ async def get_chat_history(bot_id: str, current_user: dict = Depends(get_current
     ).sort("created_at", -1).limit(100))
     
     return {"history": history}
+
+@app.post("/api/phone/verify")
+async def verify_phone_number(verification: PhoneNumberVerification, current_user: dict = Depends(get_current_user)):
+    """Verify phone number for WhatsApp Business API"""
+    # This is a placeholder - in real implementation, you would verify with WhatsApp API
+    if not validate_phone_number(verification.phone_number):
+        raise HTTPException(status_code=400, detail="Invalid phone number format")
+    
+    # Simulate verification process
+    if verification.verification_code == "123456":
+        # Save verified phone number
+        users_collection.update_one(
+            {"user_id": current_user["user_id"]},
+            {"$set": {"verified_phone": verification.phone_number}}
+        )
+        return {"message": "Phone number verified successfully", "verified": True}
+    else:
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
+@app.get("/api/phone/send-code/{phone_number}")
+async def send_verification_code(phone_number: str, current_user: dict = Depends(get_current_user)):
+    """Send verification code to phone number"""
+    if not validate_phone_number(phone_number):
+        raise HTTPException(status_code=400, detail="Invalid phone number format")
+    
+    # This is a placeholder - in real implementation, you would send SMS via WhatsApp API
+    return {"message": "Verification code sent", "code": "123456"}  # Only for demo
 
 # Webhook endpoints for different platforms
 @app.post("/api/webhooks/whatsapp/{bot_id}")
@@ -492,6 +593,78 @@ async def get_ai_models():
     }
     
     return {"models": models}
+
+# Admin endpoints
+@app.get("/api/admin/users")
+async def get_all_users(current_user: dict = Depends(get_current_user)):
+    """Get all users (superadmin only)"""
+    if current_user["role"] != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin access required")
+    
+    users = list(users_collection.find(
+        {},
+        {"_id": 0, "password": 0}
+    ).sort("created_at", -1))
+    
+    return {"users": users}
+
+@app.get("/api/admin/bots")
+async def get_all_bots(current_user: dict = Depends(get_current_user)):
+    """Get all bots (superadmin only)"""
+    if current_user["role"] != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin access required")
+    
+    pipeline = [
+        {
+            "$lookup": {
+                "from": "users",
+                "localField": "user_id",
+                "foreignField": "user_id",
+                "as": "user"
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "api_key": 0,
+                "ai_api_key": 0,
+                "user.password": 0
+            }
+        }
+    ]
+    
+    bots = list(bot_configs_collection.aggregate(pipeline))
+    
+    return {"bots": bots}
+
+@app.get("/api/admin/stats")
+async def get_admin_stats(current_user: dict = Depends(get_current_user)):
+    """Get admin statistics (superadmin only)"""
+    if current_user["role"] != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin access required")
+    
+    # Count users by plan
+    user_stats = list(users_collection.aggregate([
+        {"$group": {"_id": "$plan", "count": {"$sum": 1}}}
+    ]))
+    
+    # Count bots by platform
+    bot_stats = list(bot_configs_collection.aggregate([
+        {"$group": {"_id": "$platform", "count": {"$sum": 1}}}
+    ]))
+    
+    # Total counts
+    total_users = users_collection.count_documents({})
+    total_bots = bot_configs_collection.count_documents({})
+    total_chats = chat_history_collection.count_documents({})
+    
+    return {
+        "total_users": total_users,
+        "total_bots": total_bots,
+        "total_chats": total_chats,
+        "user_stats": user_stats,
+        "bot_stats": bot_stats
+    }
 
 # Superadmin endpoints for Xendit settings
 @app.post("/api/admin/xendit/settings")
